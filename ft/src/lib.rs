@@ -15,14 +15,15 @@ NOTES:
   - To prevent the deployed contract from being modified or deleted, it should not have any access
     keys on its account.
 */
-use near_contract_standards::fungible_token::metadata::{
-    FungibleTokenMetadata, FungibleTokenMetadataProvider, FT_METADATA_SPEC,
-};
 use near_contract_standards::fungible_token::FungibleToken;
+use near_contract_standards::fungible_token::metadata::{
+    FT_METADATA_SPEC, FungibleTokenMetadata, FungibleTokenMetadataProvider,
+};
+use near_sdk::{AccountId, Balance, env, log, near_bindgen, PanicOnDefault, PromiseOrValue, Duration, Timestamp, Promise};
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::collections::LazyOption;
-use near_sdk::json_types::{ValidAccountId, U128};
-use near_sdk::{env, log, near_bindgen, AccountId, Balance, PanicOnDefault, PromiseOrValue};
+use near_sdk::json_types::{U128, ValidAccountId, WrappedDuration};
+use near_contract_standards::upgrade::{Ownable, Upgradable};
 
 near_sdk::setup_alloc!();
 
@@ -31,6 +32,9 @@ near_sdk::setup_alloc!();
 pub struct Contract {
     token: FungibleToken,
     metadata: LazyOption<FungibleTokenMetadata>,
+    pub owner: AccountId,
+    pub staging_duration: Duration,
+    pub staging_timestamp: Timestamp,
 }
 
 const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 288 288'%3E%3Cg id='l' data-name='l'%3E%3Cpath d='M187.58,79.81l-30.1,44.69a3.2,3.2,0,0,0,4.75,4.2L191.86,103a1.2,1.2,0,0,1,2,.91v80.46a1.2,1.2,0,0,1-2.12.77L102.18,77.93A15.35,15.35,0,0,0,90.47,72.5H87.34A15.34,15.34,0,0,0,72,87.84V201.16A15.34,15.34,0,0,0,87.34,216.5h0a15.35,15.35,0,0,0,13.08-7.31l30.1-44.69a3.2,3.2,0,0,0-4.75-4.2L96.14,186a1.2,1.2,0,0,1-2-.91V104.61a1.2,1.2,0,0,1,2.12-.77l89.55,107.23a15.35,15.35,0,0,0,11.71,5.43h3.13A15.34,15.34,0,0,0,216,201.16V87.84A15.34,15.34,0,0,0,200.66,72.5h0A15.35,15.35,0,0,0,187.58,79.81Z'/%3E%3C/g%3E%3C/svg%3E";
@@ -38,7 +42,6 @@ const DATA_IMAGE_SVG_NEAR_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://
 #[near_bindgen]
 impl Contract {
     /// Initializes the contract with the given total supply owned by the given `owner_id` with
-    /// default metadata (for example purposes only).
     #[init]
     pub fn new_default_meta(owner_id: ValidAccountId, total_supply: U128) -> Self {
         Self::new(
@@ -46,12 +49,12 @@ impl Contract {
             total_supply,
             FungibleTokenMetadata {
                 spec: FT_METADATA_SPEC.to_string(),
-                name: "Example NEAR fungible token".to_string(),
-                symbol: "EXAMPLE".to_string(),
+                name: "Cadaster Game token".to_string(),
+                symbol: "CDX".to_string(),
                 icon: Some(DATA_IMAGE_SVG_NEAR_ICON.to_string()),
                 reference: None,
                 reference_hash: None,
-                decimals: 24,
+                decimals: 18,
             },
         )
     }
@@ -69,6 +72,9 @@ impl Contract {
         let mut this = Self {
             token: FungibleToken::new(b"a".to_vec()),
             metadata: LazyOption::new(b"m".to_vec(), Some(&metadata)),
+            owner: owner_id.clone().into(),
+            staging_duration: 0,
+            staging_timestamp: 0,
         };
         this.token.internal_register_account(owner_id.as_ref());
         this.token.internal_deposit(owner_id.as_ref(), total_supply.into());
@@ -82,6 +88,33 @@ impl Contract {
     fn on_tokens_burned(&mut self, account_id: AccountId, amount: Balance) {
         log!("Account @{} burned {}", account_id, amount);
     }
+
+    #[init(ignore_state)]
+    pub fn migrate_state() -> Self {
+
+        #[derive(BorshDeserialize)]
+        struct OldContract {
+            token: FungibleToken,
+            metadata: LazyOption<FungibleTokenMetadata>,
+            pub owner: AccountId,
+            pub staging_duration: Duration,
+            pub staging_timestamp: Timestamp,
+            tester: String,
+        }
+
+        let _old_contract: OldContract = env::state_read().expect("Old state doesn't exist");
+
+        assert_eq!(env::signer_account_id(), _old_contract.owner, "only the contract owner can migrate");
+
+        Self {
+            metadata: _old_contract.metadata,
+            owner: _old_contract.owner,
+            staging_duration: _old_contract.staging_duration,
+            staging_timestamp: _old_contract.staging_timestamp,
+            token: _old_contract.token,
+        }
+    }
+
 }
 
 near_contract_standards::impl_fungible_token_core!(Contract, token, on_tokens_burned);
@@ -94,11 +127,56 @@ impl FungibleTokenMetadataProvider for Contract {
     }
 }
 
+#[near_bindgen]
+impl Ownable for Contract {
+    fn get_owner(&self) -> AccountId {
+        self.owner.clone()
+    }
+
+    fn set_owner(&mut self, owner: AccountId) {
+        self.assert_owner();
+        self.owner = owner;
+    }
+}
+
+#[near_bindgen]
+impl Upgradable for Contract {
+    fn get_staging_duration(&self) -> WrappedDuration {
+        self.staging_duration.into()
+    }
+
+    fn stage_code(&mut self, code: Vec<u8>, timestamp: Timestamp) {
+        self.assert_owner();
+        assert!(
+            env::block_timestamp() + self.staging_duration < timestamp,
+            "Timestamp must be later than staging duration"
+        );
+        // Writes directly into storage to avoid serialization penalty by using default struct
+        env::storage_write(b"upgrade", &code);
+        self.staging_timestamp = timestamp;
+    }
+
+    fn deploy_code(&mut self) -> Promise {
+        if self.staging_timestamp < env::block_timestamp() {
+            env::panic(
+                &format!(
+                    "Deploy code too early: staging ends on {}",
+                    self.staging_timestamp + self.staging_duration
+                )
+                    .into_bytes(),
+            )
+        }
+        let code = env::storage_read(b"upgrade").expect("No upgrade code available");
+        env::storage_remove(b"upgrade");
+        Promise::new(env::current_account_id()).deploy_contract(code)
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use near_sdk::test_utils::{accounts, VMContextBuilder};
+    use near_sdk::{Balance, testing_env};
     use near_sdk::MockedBlockchain;
-    use near_sdk::{testing_env, Balance};
+    use near_sdk::test_utils::{accounts, VMContextBuilder};
 
     use super::*;
 
